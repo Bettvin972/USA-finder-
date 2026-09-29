@@ -1,18 +1,4 @@
 
-"""
-V17.0 — Multi-platform public WhatsApp group discovery bot
-
-Discovery sources:
-- Existing public group-link directories
-- DuckDuckGo HTML search for indexed public pages/posts on Facebook, X, TikTok,
-  Reddit, and the wider web
-- Optional Google Programmable Search JSON API
-
-The bot does not log in to social platforms, bypass access controls, or access
-private/member-only groups. Search-engine indexing is incomplete and results
-are not guaranteed to be current.
-"""
-
 import os
 import re
 import json
@@ -21,356 +7,362 @@ import html
 import logging
 import threading
 from datetime import datetime, timezone
-from urllib.parse import quote_plus, unquote
+from urllib.parse import quote_plus, urlparse
 
 import requests
 from flask import Flask, jsonify
 
-VERSION = "V17.0"
-app = Flask(__name__)
+# ============================================================
+# V18 WHATSAPP PUBLIC GROUP DISCOVERY BOT
+# ============================================================
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
 PORT = int(os.getenv("PORT", "10000"))
 SCAN_INTERVAL = max(300, int(os.getenv("SCAN_INTERVAL", "1800")))
-MAX_RESULTS_PER_SCAN = max(10, int(os.getenv("MAX_RESULTS_PER_SCAN", "150")))
-DB_FILE = os.getenv("SEEN_FILE", "seen_v17.json")
-
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
-GOOGLE_CX = os.getenv("GOOGLE_CX", "").strip()
-
-WA_REGEX = re.compile(
-    r"https?://chat\.whatsapp\.com/[A-Za-z0-9]{20,26}",
-    re.IGNORECASE,
-)
-
-SPAM_TERMS = (
-    "earn money", "crypto", "bitcoin", "forex", "betting", "adult",
-    "18+", "xxx", "porn", "onlyfans", "hot girls", "lottery",
-    "giveaway money",
-)
-
-# Queries focus on publicly advertised student communities.
-BASE_QUERIES = [
-    '"WhatsApp" "USA students" group',
-    '"WhatsApp group" "international students" USA',
-    '"WhatsApp" university students USA group',
-    '"WhatsApp" student housing USA',
-    '"WhatsApp" student rideshare USA',
-    '"WhatsApp" Indian students USA group',
-    '"WhatsApp" African students USA group',
-    '"WhatsApp" college students USA',
-    '"WhatsApp" new students USA university',
-]
-
-PLATFORM_QUERIES = {
-    "Facebook": [
-        'site:facebook.com "WhatsApp" "students" USA group',
-        'site:facebook.com "chat.whatsapp.com" university students',
-    ],
-    "X": [
-        'site:x.com "chat.whatsapp.com" students USA',
-        'site:twitter.com "WhatsApp group" university students',
-    ],
-    "TikTok": [
-        'site:tiktok.com "chat.whatsapp.com" students',
-        'site:tiktok.com "WhatsApp group" USA students',
-    ],
-    "Reddit": [
-        'site:reddit.com "chat.whatsapp.com" students USA',
-        'site:reddit.com "WhatsApp group" international students',
-    ],
-}
-
-DIRECTORY_SOURCES = [
-    "https://whatsgrouplink.com/usa/",
-    "https://groupsjoin.com/usa-whatsapp-group-links",
-    "https://www.whatsappgroupslink.com/search/label/USA",
-    "https://whatsgrouplinks.org/usa-whatsapp-group-links/",
-    "https://whatsappgroupslink.com/usa/",
-    "https://www.invite-link.com/whatsapp-group-links/usa/",
-    "https://whatsgrouplink.com/category/usa/",
-    "https://groupslinky.com/usa-whatsapp-group-links/",
-]
+MAX_RESULTS = max(10, int(os.getenv("MAX_RESULTS_PER_SCAN", "100")))
+TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "12")))
+SEEN_FILE = os.getenv("SEEN_FILE", "seen_v18.json")
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(threadName)s: %(message)s"
 )
-log = logging.getLogger("pure-wa-v17")
+
+log = logging.getLogger("wa-v18")
+
+app = Flask(__name__)
 
 http = requests.Session()
 http.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; PublicGroupDiscovery/17.0)"
+    "User-Agent": "Mozilla/5.0 (compatible; PublicLinkDiscovery/18.0)"
 })
 
-state_lock = threading.RLock()
-scan_lock = threading.Lock()
-seen = set()
+# ============================================================
+# SEARCH QUERIES
+# ============================================================
 
-stats = {
-    "scans": 0,
-    "last_scan": None,
-    "last_status": "Starting",
-    "last_candidates": 0,
-    "new_links": 0,
-    "errors": 0,
-    "by_platform": {},
-}
+TERMS = [
+    '"chat.whatsapp.com" USA university students',
+    '"chat.whatsapp.com" college students USA',
+    '"chat.whatsapp.com" international students USA',
+    '"chat.whatsapp.com" student housing USA',
+    '"chat.whatsapp.com" student roommates USA',
+    '"chat.whatsapp.com" student rideshare USA',
+    '"chat.whatsapp.com" Indian students USA',
+    '"chat.whatsapp.com" African students USA',
+    'site:reddit.com "chat.whatsapp.com" students USA',
+    'site:facebook.com "chat.whatsapp.com" university students',
+    'site:x.com "chat.whatsapp.com" students',
+    'site:tiktok.com "chat.whatsapp.com" students',
+    'site:instagram.com "chat.whatsapp.com" students'
+]
 
+# Optional Google Programmable Search configuration
+GOOGLE_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+GOOGLE_CX = os.getenv("GOOGLE_CX", "").strip()
+
+INVITE_RE = re.compile(
+    r'(?:https?://)?chat\.whatsapp\.com/[A-Za-z0-9_-]{10,}(?:\?[^\s"\'<>]*)?',
+    re.IGNORECASE
+)
 
 # ============================================================
-# MEMORY
+# THREADING AND STATE
+# ============================================================
+
+lock = threading.RLock()
+scan_lock = threading.Lock()
+stop = threading.Event()
+
+state = {
+    "started_at": datetime.now(timezone.utc).isoformat(),
+    "last_scan_started": None,
+    "last_scan_finished": None,
+    "last_scan_status": "Not started",
+    "last_scan_error": None,
+    "last_scan_found": 0,
+    "last_scan_sent": 0,
+    "total_scans": 0,
+    "total_links_found": 0,
+    "total_links_sent": 0,
+    "telegram_offset": 0
+}
+
+# ============================================================
+# DUPLICATE DATABASE
 # ============================================================
 
 def load_seen():
-    global seen
-
     try:
-        if os.path.isfile(DB_FILE):
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                value = json.load(f)
+        with open(SEEN_FILE, encoding="utf-8") as f:
+            data = json.load(f)
 
-            if isinstance(value, list):
-                with state_lock:
-                    seen = set(value)
+        return data if isinstance(data, dict) else {}
 
-    except (OSError, ValueError) as exc:
-        log.warning("Could not load seen-link database: %s", exc)
+    except FileNotFoundError:
+        return {}
+
+    except Exception:
+        log.exception("Seen database could not be loaded")
+        return {}
+
+
+seen = load_seen()
 
 
 def save_seen():
-    try:
-        with state_lock:
-            snapshot = sorted(seen)
+    temporary_file = SEEN_FILE + ".tmp"
 
-        temp = DB_FILE + ".tmp"
+    with open(temporary_file, "w", encoding="utf-8") as f:
+        json.dump(seen, f, ensure_ascii=False, indent=2)
 
-        with open(temp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f)
-
-        os.replace(temp, DB_FILE)
-
-    except OSError:
-        log.exception("Could not persist seen-link database")
-
-
-def remember(url):
-    with state_lock:
-        if url in seen:
-            return False
-
-        seen.add(url)
-
-    save_seen()
-    return True
+    os.replace(temporary_file, SEEN_FILE)
 
 
 # ============================================================
-# TELEGRAM
+# WHATSAPP LINK CLEANING
 # ============================================================
 
-def telegram_send(message):
-    if not TOKEN or not CHAT_ID:
-        log.info("Telegram not configured; notification skipped")
+def clean_link(raw):
+    raw = html.unescape(raw.strip().rstrip(".,);]}>"))
+
+    if not raw.lower().startswith("http"):
+        raw = "https://" + raw
+
+    parsed = urlparse(raw)
+
+    if parsed.netloc.lower() not in (
+        "chat.whatsapp.com",
+        "www.chat.whatsapp.com"
+    ):
+        return None
+
+    token = parsed.path.strip("/").split("/")[0]
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", token or ""):
+        return None
+
+    return "https://chat.whatsapp.com/" + token
+
+
+# ============================================================
+# TELEGRAM API
+# ============================================================
+
+def tg(method, payload=None, timeout=30):
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+
+    response = http.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+        json=payload or {},
+        timeout=timeout
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(str(data))
+
+    return data.get("result")
+
+
+def send(message, chat=None):
+    target = str(chat or CHAT_ID)
+
+    if not target:
         return False
 
     try:
-        response = http.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
+        tg(
+            "sendMessage",
+            {
+                "chat_id": target,
                 "text": message,
                 "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=15,
+                "disable_web_page_preview": True
+            }
         )
 
-        response.raise_for_status()
-        return bool(response.json().get("ok"))
+        return True
 
-    except requests.RequestException:
+    except Exception:
         log.exception("Telegram send failed")
         return False
 
 
 # ============================================================
-# LINK VALIDATION
+# SEARCH ENGINE
 # ============================================================
 
-def is_valid_wa(url):
-    return bool(WA_REGEX.fullmatch(url.strip()))
-
-
-def is_spam(text):
-    low = (text or "").lower()
-    return any(term in low for term in SPAM_TERMS)
-
-
-def extract_links(text):
-    if not text:
-        return set()
-
-    candidates = set()
-
-    for variant in (html.unescape(text), unquote(html.unescape(text))):
-        for match in WA_REGEX.findall(variant):
-            cleaned = match.rstrip(".,;:!?)\\]}'\"")
-
-            if is_valid_wa(cleaned):
-                candidates.add(cleaned)
-
-    return candidates
-
-
-# ============================================================
-# WEB REQUESTS
-# ============================================================
-
-def get_page(url, timeout=15):
+def search(query):
     try:
-        response = http.get(url, timeout=timeout)
+        # Use Google if API credentials are configured.
+        if GOOGLE_KEY and GOOGLE_CX:
 
-        if response.status_code == 200:
-            return response.text
+            response = http.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={
+                    "key": GOOGLE_KEY,
+                    "cx": GOOGLE_CX,
+                    "q": query,
+                    "num": 10
+                },
+                timeout=TIMEOUT
+            )
 
-        log.info("HTTP %s from %s", response.status_code, url)
+            response.raise_for_status()
 
-    except requests.RequestException as exc:
-        log.warning("Fetch failed for %s: %s", url, exc)
+            return json.dumps(
+                response.json().get("items", []),
+                ensure_ascii=False
+            )
 
-    return ""
-
-
-def duckduckgo_search(query):
-    """Search public/indexed pages; not a direct social-platform API."""
-
-    url = (
-        "https://html.duckduckgo.com/html/?q="
-        + quote_plus(query)
-    )
-
-    page = get_page(url)
-    return extract_links(page)
-
-
-def google_search(query):
-    """Optional official Google Programmable Search API integration."""
-
-    if not (GOOGLE_API_KEY and GOOGLE_CX):
-        return set()
-
-    try:
+        # Otherwise use DuckDuckGo HTML search.
         response = http.get(
-            "https://www.googleapis.com/customsearch/v1",
-            params={
-                "key": GOOGLE_API_KEY,
-                "cx": GOOGLE_CX,
-                "q": query,
-                "num": 10,
-            },
-            timeout=20,
+            "https://html.duckduckgo.com/html/?q=" + quote_plus(query),
+            timeout=TIMEOUT
         )
 
         response.raise_for_status()
-        data = response.json()
 
-        combined = "\n".join(
-            str(item.get("link", ""))
-            + "\n"
-            + str(item.get("title", ""))
-            + "\n"
-            + str(item.get("snippet", ""))
-            for item in data.get("items", [])
-        )
+        return response.text
 
-        return extract_links(combined)
-
-    except (requests.RequestException, ValueError) as exc:
-        log.warning("Google search failed: %s", exc)
-        return set()
-
-
-def identify_platform(query):
-    q = query.lower()
-
-    if "site:facebook.com" in q:
-        return "Facebook-indexed"
-
-    if "site:x.com" in q or "site:twitter.com" in q:
-        return "X-indexed"
-
-    if "site:tiktok.com" in q:
-        return "TikTok-indexed"
-
-    if "site:reddit.com" in q:
-        return "Reddit-indexed"
-
-    return "Web search"
+    except Exception as error:
+        log.warning("Search failed (%s): %s", query, error)
+        return ""
 
 
 # ============================================================
-# WHATSAPP INVITATION CHECK
+# DISCOVERY ENGINE
 # ============================================================
 
-def verify_invite(url):
+def discover():
+    results = {}
+
+    # Rotate search order between scans.
+    rotation = int(time.time() // SCAN_INTERVAL) % len(TERMS)
+
+    queries = TERMS[rotation:] + TERMS[:rotation]
+
+    for query in queries:
+
+        if stop.is_set():
+            break
+
+        page = search(query)
+
+        for raw in INVITE_RE.findall(page):
+
+            link = clean_link(raw)
+
+            if link:
+                results.setdefault(link, query)
+
+        if len(results) >= MAX_RESULTS:
+            break
+
+        # Moderate request pacing.
+        time.sleep(1)
+
+    return dict(list(results.items())[:MAX_RESULTS])
+
+
+# ============================================================
+# INVITATION VALIDATION
+# ============================================================
+
+def validate(link):
     """
-    Best-effort page check only.
+    Best-effort check of a public invitation page.
 
-    WhatsApp may change page markup, block automated requests,
-    or show a preview without confirming joinability.
+    A loaded page does not guarantee that a person can join.
     """
 
     try:
         response = http.get(
-            url,
-            timeout=12,
-            allow_redirects=True,
+            link,
+            timeout=TIMEOUT,
+            allow_redirects=True
         )
 
-        if response.status_code != 200:
-            return "Unverified"
+        body = (response.text or "").lower()
 
-        body = html.unescape(response.text).lower()
-
-        dead_phrases = (
-            "invalid invite",
-            "invite link has expired",
-            "invite link is no longer valid",
-            "invite link was revoked",
-            "couldn't find",
+        title_match = re.search(
+            r"<title[^>]*>(.*?)</title>",
+            body,
+            re.IGNORECASE | re.DOTALL
         )
 
-        if any(phrase in body for phrase in dead_phrases):
-            return "Appears expired/invalid"
+        title = ""
 
-        live_phrases = (
-            "join group",
-            "join chat",
-            "group invite",
+        if title_match:
+            title = re.sub(
+                r"\s+",
+                " ",
+                title_match.group(1)
+            ).strip()
+
+        if response.status_code in (404, 410):
+            return "Appears unavailable", f"HTTP {response.status_code}"
+
+        invalid_messages = [
+            "invite link was reset",
+            "invite link has been reset",
+            "this invite link is no longer valid",
+            "invalid invite link",
+            "link has been revoked"
+        ]
+
+        if any(message in body for message in invalid_messages):
+            return (
+                "Appears invalid/reset",
+                title or "WhatsApp indicates an invalid invitation"
+            )
+
+        if response.status_code == 200 and (
+            "whatsapp" in title.lower()
+            or "join" in body
+            or "group" in body
+        ):
+            return (
+                "Invitation page detected (joinability unconfirmed)",
+                title or "Page loaded"
+            )
+
+        return (
+            "Unverified",
+            f"HTTP {response.status_code}; automated check inconclusive"
         )
 
-        if any(phrase in body for phrase in live_phrases):
-            return "Invitation page detected"
-
-        return "Unverified"
-
-    except requests.RequestException:
-        return "Unverified"
+    except requests.RequestException as error:
+        return (
+            "Unverified",
+            f"Check blocked/failed: {type(error).__name__}"
+        )
 
 
 # ============================================================
-# SEARCH QUERY GENERATOR
+# TELEGRAM MESSAGE FORMAT
 # ============================================================
 
-def all_searches():
-    for query in BASE_QUERIES:
-        yield query
+def esc(value):
+    return html.escape(str(value), quote=False)
 
-    for queries in PLATFORM_QUERIES.values():
-        for query in queries:
-            yield query
+
+def format_message(link, source, status, detail):
+    return (
+        "🔎 <b>Public WhatsApp group link discovered</b>\n\n"
+        f"🔗 {esc(link)}\n"
+        f"🧪 <b>Check:</b> {esc(status)}\n"
+        f"ℹ️ <b>Details:</b> {esc(detail[:220])}\n"
+        f"🌐 <b>Search:</b> {esc(source[:160])}\n\n"
+        "<i>Automated checks cannot guarantee that a group accepts new members.</i>"
+    )
 
 
 # ============================================================
@@ -380,311 +372,321 @@ def all_searches():
 def run_scan():
 
     if not scan_lock.acquire(blocking=False):
-        telegram_send("⏳ A scan is already running.")
-        return
+        log.info("Scan already running; skipping")
+        return {"status": "already_running"}
+
+    with lock:
+        state["last_scan_started"] = datetime.now(timezone.utc).isoformat()
+        state["last_scan_status"] = "Running"
+        state["last_scan_error"] = None
+        state["total_scans"] += 1
+
+    found = 0
+    sent = 0
 
     try:
-        with state_lock:
-            stats["last_status"] = "Scanning"
+        links = discover()
+        found = len(links)
 
-        telegram_send(
-            f"🔎 <b>{VERSION} MULTI-PLATFORM SCAN STARTED</b>\n"
-            f"Directories: {len(DIRECTORY_SOURCES)}\n"
-            "Search: public/indexed Facebook, X, TikTok, Reddit and web pages"
-        )
+        for link, source in links.items():
 
-        discovered = {}
+            if stop.is_set():
+                break
 
-        # Scan existing public directories.
-        for source in DIRECTORY_SOURCES:
-            page = get_page(source)
+            with lock:
+                already_seen = link in seen
 
-            for url in extract_links(page):
-                discovered.setdefault(url, "Group-link directory")
-
-            time.sleep(0.8)
-
-        # Search public/indexed social media and web content.
-        for query in all_searches():
-            platform = identify_platform(query)
-
-            try:
-                links = duckduckgo_search(query)
-
-                for url in links:
-                    discovered.setdefault(url, platform)
-
-                # Google is optional and requires API credentials.
-                for url in google_search(query):
-                    discovered.setdefault(url, "Google indexed search")
-
-                time.sleep(1.2)
-
-            except Exception:
-                log.exception("Search query failed: %s", query)
-
-        with state_lock:
-            stats["last_candidates"] = len(discovered)
-
-        sent = 0
-        checked = 0
-        platform_counts = {}
-
-        for url, source in list(discovered.items())[:MAX_RESULTS_PER_SCAN]:
-
-            if not is_valid_wa(url) or is_spam(url):
+            if already_seen:
                 continue
 
-            if not remember(url):
+            status, detail = validate(link)
+
+            # Record processed links to prevent repeated notifications.
+            with lock:
+                seen[link] = {
+                    "first_seen": datetime.now(timezone.utc).isoformat(),
+                    "status": status,
+                    "source": source
+                }
+
+                save_seen()
+
+            # Skip links that clearly appear unavailable or revoked.
+            if status in (
+                "Appears unavailable",
+                "Appears invalid/reset"
+            ):
+                log.info(
+                    "Filtered stale invitation %s (%s)",
+                    link,
+                    status
+                )
                 continue
 
-            checked += 1
-            status = verify_invite(url)
+            if send(format_message(link, source, status, detail)):
+                sent += 1
 
-            platform_counts[source] = (
-                platform_counts.get(source, 0) + 1
+            time.sleep(0.4)
+
+        with lock:
+            state.update(
+                last_scan_status="Completed",
+                last_scan_finished=datetime.now(timezone.utc).isoformat(),
+                last_scan_found=found,
+                last_scan_sent=sent,
+                total_links_found=state["total_links_found"] + found,
+                total_links_sent=state["total_links_sent"] + sent
             )
 
-            sent += 1
-
-            safe_url = html.escape(url)
-            safe_source = html.escape(source)
-            safe_status = html.escape(status)
-
-            telegram_send(
-                f"🔗 <b>WhatsApp invitation discovered #{sent}</b>\n\n"
-                f"Source: {safe_source}\n"
-                f"Automated check: <b>{safe_status}</b>\n"
-                f"<code>{safe_url}</code>\n\n"
-                "<i>Check the invitation in WhatsApp before sharing.</i>"
-            )
-
-            time.sleep(0.7)
-
-        with state_lock:
-            stats["scans"] += 1
-            stats["last_scan"] = datetime.now(
-                timezone.utc
-            ).isoformat()
-            stats["last_status"] = "Completed"
-            stats["new_links"] += sent
-            stats["by_platform"] = platform_counts
-
-        telegram_send(
-            "🏁 <b>SCAN COMPLETE</b>\n\n"
-            f"Unique candidates: {len(discovered)}\n"
-            f"New invitations reported: {sent}\n"
-            f"New links checked: {checked}\n"
-            f"Remembered links: {len(seen)}"
+        log.info(
+            "Scan complete found=%d sent=%d",
+            found,
+            sent
         )
 
-    except Exception:
+        return {
+            "status": "completed",
+            "found": found,
+            "sent": sent
+        }
+
+    except Exception as error:
+
         log.exception("Scan failed")
 
-        with state_lock:
-            stats["errors"] += 1
-            stats["last_status"] = "Error"
+        with lock:
+            state["last_scan_status"] = "Failed; scheduled retry"
+            state["last_scan_error"] = (
+                f"{type(error).__name__}: {error}"
+            )[:400]
 
-        telegram_send(
-            "❌ Scan encountered an unexpected error. "
-            "Check server logs."
+            state["last_scan_finished"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+
+        send(
+            "⚠️ <b>V18 scan error.</b>\n"
+            + esc(f"{type(error).__name__}: {error}")[:300]
+            + "\nThe scheduler will retry at the next interval."
         )
+
+        return {"status": "failed"}
 
     finally:
         scan_lock.release()
 
 
 # ============================================================
-# TELEGRAM COMMANDS
+# STATUS COMMAND
 # ============================================================
 
-def handle_command(text):
+def status_text():
 
-    command = text.strip().split()[0].split("@")[0].lower()
+    with lock:
+        snapshot = dict(state)
 
-    if command == "/start":
-
-        telegram_send(
-            f"👋 <b>{VERSION} MULTI-PLATFORM DISCOVERY</b>\n\n"
-            "Finds publicly indexed WhatsApp invitations from the web "
-            "and social-platform search results.\n\n"
-            "<b>Commands</b>\n"
-            "/scan — start a scan\n"
-            "/status — show status\n"
-            "/clear — clear duplicate memory"
-        )
-
-    elif command == "/scan":
-
-        threading.Thread(
-            target=run_scan,
-            daemon=True,
-        ).start()
-
-    elif command == "/status":
-
-        with state_lock:
-            current = dict(stats)
-            memory_count = len(seen)
-
-        telegram_send(
-            "📊 <b>V17 STATUS</b>\n\n"
-            f"Running: {scan_lock.locked()}\n"
-            f"Completed scans: {current['scans']}\n"
-            f"Last candidates: {current['last_candidates']}\n"
-            f"New links reported: {current['new_links']}\n"
-            f"Errors: {current['errors']}\n"
-            f"Remembered: {memory_count}\n"
-            f"Last scan: {current['last_scan'] or 'Never'}\n"
-            f"Status: {current['last_status']}"
-        )
-
-    elif command == "/clear":
-
-        if scan_lock.locked():
-            telegram_send(
-                "⚠️ Wait until the current scan finishes "
-                "before clearing memory."
-            )
-            return
-
-        with state_lock:
-            seen.clear()
-
-        save_seen()
-
-        telegram_send("🗑️ Duplicate memory cleared.")
+    return (
+        "🤖 <b>WhatsApp Discovery Bot V18</b>\n\n"
+        f"Status: <b>{esc(snapshot['last_scan_status'])}</b>\n"
+        f"Last started: {esc(snapshot['last_scan_started'] or 'Never')}\n"
+        f"Last finished: {esc(snapshot['last_scan_finished'] or 'Never')}\n"
+        f"Found last scan: {snapshot['last_scan_found']} | "
+        f"Sent: {snapshot['last_scan_sent']}\n"
+        f"Total scans: {snapshot['total_scans']}\n"
+        f"Total links found: {snapshot['total_links_found']}\n"
+        f"Total links sent: {snapshot['total_links_sent']}\n"
+        f"Interval: {SCAN_INTERVAL // 60} minutes\n"
+        f"Last error: {esc(snapshot['last_scan_error'] or 'None')}"
+    )
 
 
 # ============================================================
-# TELEGRAM LONG POLLING
+# TELEGRAM COMMAND HANDLER
 # ============================================================
 
-def telegram_polling():
+def allowed(chat):
+    return bool(CHAT_ID) and str(chat) == str(CHAT_ID)
 
-    offset = 0
 
-    try:
-        http.post(
-            f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
-            timeout=10,
-        )
+def telegram_loop():
 
-    except requests.RequestException:
-        log.exception("Could not delete webhook")
+    if not BOT_TOKEN:
+        log.error("Telegram disabled: token not configured")
+        return
 
-    while True:
+    delay = 2
+
+    log.info("Telegram polling started")
+
+    while not stop.is_set():
 
         try:
-            response = http.get(
-                f"https://api.telegram.org/bot{TOKEN}/getUpdates",
-                params={
-                    "offset": offset,
-                    "timeout": 30,
-                    "allowed_updates": json.dumps(["message"]),
+            updates = tg(
+                "getUpdates",
+                {
+                    "offset": state["telegram_offset"],
+                    "timeout": 20,
+                    "allowed_updates": ["message"]
                 },
-                timeout=35,
+                timeout=30
             )
 
-            response.raise_for_status()
-            payload = response.json()
+            delay = 2
 
-            for update in payload.get("result", []):
+            for update in updates or []:
 
-                offset = update["update_id"] + 1
-
-                message = update.get("message", {})
-                chat_id = str(
-                    message.get("chat", {}).get("id", "")
+                state["telegram_offset"] = max(
+                    state["telegram_offset"],
+                    int(update.get("update_id", 0)) + 1
                 )
 
-                # Only the configured chat may control the bot.
-                if chat_id != CHAT_ID:
+                message = update.get("message") or {}
+
+                chat = (message.get("chat") or {}).get("id")
+                text = (message.get("text") or "").strip()
+
+                if not allowed(chat):
+                    log.warning(
+                        "Ignored unauthorized chat %s",
+                        chat
+                    )
                     continue
 
-                text = message.get("text", "")
+                command = (
+                    text.split()[0].split("@")[0].lower()
+                    if text else ""
+                )
 
-                if text.startswith("/"):
-                    handle_command(text)
+                if command in ("/start", "/help"):
 
-        except requests.RequestException:
-            log.exception("Telegram polling network error")
-            time.sleep(5)
+                    send(
+                        "Welcome to <b>WhatsApp Discovery Bot V18</b>.\n\n"
+                        "/scan — scan now\n"
+                        "/status — bot status\n"
+                        "/help — commands",
+                        chat
+                    )
+
+                elif command == "/status":
+
+                    send(status_text(), chat)
+
+                elif command == "/scan":
+
+                    if scan_lock.locked():
+
+                        send(
+                            "A scan is already running. Check /status.",
+                            chat
+                        )
+
+                    else:
+
+                        send(
+                            "🔍 Scan started; results will arrive as they are processed.",
+                            chat
+                        )
+
+                        threading.Thread(
+                            target=run_scan,
+                            name="manual-scan",
+                            daemon=True
+                        ).start()
+
+                else:
+
+                    send("Unknown command. Use /help.", chat)
 
         except Exception:
-            log.exception("Telegram polling error")
-            time.sleep(3)
+
+            log.exception(
+                "Telegram polling failed; reconnecting in %ds",
+                delay
+            )
+
+            stop.wait(delay)
+            delay = min(delay * 2, 60)
 
 
 # ============================================================
-# AUTOMATIC SCANNING
+# AUTOMATIC SCANNER
 # ============================================================
 
-def automatic_scanner():
+def scheduler():
 
-    time.sleep(15)
+    log.info("Scheduler active; first scan in 15 seconds")
 
-    while True:
-        run_scan()
-        time.sleep(SCAN_INTERVAL)
+    if stop.wait(15):
+        return
+
+    while not stop.is_set():
+
+        try:
+            run_scan()
+
+        except Exception:
+            log.exception(
+                "Scheduler recovered from unexpected error"
+            )
+
+        stop.wait(SCAN_INTERVAL)
 
 
 # ============================================================
-# FLASK HEALTH CHECK
+# FLASK HEALTH ENDPOINTS
 # ============================================================
 
 @app.get("/")
 def home():
 
-    return jsonify({
-        "service": "PURE WA multi-platform discovery",
-        "version": VERSION,
-        "status": "online",
-    })
+    return (
+        "<h2>WhatsApp Discovery Bot V18</h2>"
+        "<p>Service is running.</p>"
+        "<p><a href='/health'>Health</a></p>"
+    )
 
 
 @app.get("/health")
 def health():
 
-    return jsonify({
-        "status": "healthy",
-        "version": VERSION,
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
-    })
+    with lock:
+        snapshot = dict(state)
+
+    return jsonify(
+        ok=True,
+        service="whatsapp-discovery-v18",
+        telegram_configured=bool(BOT_TOKEN and CHAT_ID),
+        scan_status=snapshot["last_scan_status"],
+        last_scan_finished=snapshot["last_scan_finished"],
+        last_error=snapshot["last_scan_error"]
+    )
 
 
 # ============================================================
-# STARTUP
+# START BACKGROUND THREADS
 # ============================================================
 
-load_seen()
+def start_threads():
 
-if TOKEN and CHAT_ID:
+    if getattr(start_threads, "started", False):
+        return
+
+    start_threads.started = True
 
     threading.Thread(
-        target=telegram_polling,
-        daemon=True,
+        target=telegram_loop,
+        name="telegram-polling",
+        daemon=True
     ).start()
 
     threading.Thread(
-        target=automatic_scanner,
-        daemon=True,
+        target=scheduler,
+        name="scan-scheduler",
+        daemon=True
     ).start()
 
-    log.info(
-        "%s started; remembered links=%d",
-        VERSION,
-        len(seen),
-    )
 
-else:
-
-    log.warning(
-        "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
-        "to enable the bot."
-    )
+start_threads()
 
 
 if __name__ == "__main__":
@@ -692,4 +694,5 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=PORT,
-)
+        threaded=True
+  )
