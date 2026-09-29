@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -36,7 +35,7 @@ app = Flask(__name__)
 
 http = requests.Session()
 http.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; PublicLinkDiscovery/18.0)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 })
 
 # ============================================================
@@ -203,7 +202,6 @@ def search(query):
     try:
         # Use Google if API credentials are configured.
         if GOOGLE_KEY and GOOGLE_CX:
-
             response = http.get(
                 "https://www.googleapis.com/customsearch/v1",
                 params={
@@ -225,13 +223,17 @@ def search(query):
         # Otherwise use DuckDuckGo HTML search.
         response = http.get(
             "https://html.duckduckgo.com/html/?q=" + quote_plus(query),
-            timeout=TIMEOUT
+            timeout=TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         )
 
         response.raise_for_status()
 
         return response.text
 
+    except requests.exceptions.RequestException as error:
+        log.warning("Search request timed out or was blocked (%s): %s", query, error)
+        return ""
     except Exception as error:
         log.warning("Search failed (%s): %s", query, error)
         return ""
@@ -597,11 +599,11 @@ def telegram_loop():
 
                     send("Unknown command. Use /help.", chat)
 
-        except Exception:
+        except Exception as err:
 
-            log.exception(
-                "Telegram polling failed; reconnecting in %ds",
-                delay
+            log.warning(
+                "Telegram polling error: %s; retrying in %ds",
+                err, delay
             )
 
             stop.wait(delay)
@@ -662,6 +664,16 @@ def health():
     )
 
 
+@app.get("/clear_webhook")
+def clear_webhook():
+    """Utility route to reset active Telegram Webhooks if experiencing 409 Conflict."""
+    try:
+        res = tg("deleteWebhook", {"drop_pending_updates": True})
+        return jsonify(ok=True, result=res)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
 # ============================================================
 # START BACKGROUND THREADS
 # ============================================================
@@ -686,13 +698,10 @@ def start_threads():
     ).start()
 
 
-start_threads()
-
-
 if __name__ == "__main__":
-
+    start_threads()
     app.run(
         host="0.0.0.0",
         port=PORT,
         threaded=True
-  )
+    )
